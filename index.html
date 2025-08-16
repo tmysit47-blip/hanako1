@@ -1,0 +1,490 @@
+<!doctype html>
+<html lang="ja">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width,initial-scale=1,user-scalable=no" />
+<title>崩れるタワー</title>
+<meta name="theme-color" content="#0e1012" />
+<link rel="manifest" href="manifest.webmanifest">
+<style>
+  html,body{margin:0;height:100%;background:#0e1012;color:#e7e9ea;font-family:system-ui,Segoe UI,Roboto,Helvetica,Arial}
+  #ui{position:fixed;left:12px;top:12px;display:flex;gap:.5rem;z-index:10;align-items:center}
+  .btn{background:#181b20;border:1px solid #2a2f38;padding:.5rem .8rem;border-radius:10px;color:#e7e9ea;cursor:pointer}
+  .btn:hover{background:#20242b}
+  #panel{position:fixed;right:12px;top:12px;display:flex;gap:.75rem;z-index:10;background:#121418aa;border:1px solid #272c35;padding:.5rem .75rem;border-radius:12px}
+  #hint{position:fixed;left:12px;bottom:12px;background:#121418aa;border:1px solid #272c35;border-radius:8px;padding:.4rem .6rem;opacity:.9}
+  #toast{position:fixed;left:50%;top:14%;transform:translateX(-50%);padding:.6rem 1rem;border-radius:10px;background:#11151bdd;border:1px solid #2b3240;display:none;z-index:20}
+  canvas{display:block;touch-action:none}
+</style>
+</head>
+<body>
+  <div id="ui">
+    <button id="reset" class="btn">リセット</button>
+    <button id="rebuild" class="btn">同じレベル</button>
+    <button id="next" class="btn">次のレベル</button>
+    <button id="bgm" class="btn">BGM ON</button>
+  </div>
+  <div id="panel">
+    <span>Lv.<span id="level">1</span></span>
+    <span style="margin-left:.6rem">Targets:<span id="targetsLeft">0</span></span>
+    <span style="margin-left:.6rem">Score:<span id="score">0</span></span>
+    <span style="margin-left:.6rem">Shots:<span id="shots">0</span></span>
+  </div>
+  <div id="hint">黒い“縦2段ターゲット”を全部落とすとクリア！ 弾はドラッグ→離すで発射。</div>
+  <div id="toast">Stage Clear!</div>
+
+  <!-- ① ローカルの matter.min.js を同じフォルダに置いてください -->
+  <script src="./matter.min.js"></script>
+
+  <script>
+  // ====== PWA：Service Worker登録 ======
+  if ('serviceWorker' in navigator) {
+    window.addEventListener('load', () => {
+      navigator.serviceWorker.register('./service-worker.js');
+    });
+  }
+
+  // ====== ここからゲーム本体（あなたの安定版そのまま） ======
+  (()=> {
+    const {Engine,Render,Runner,World,Bodies,Composite,Constraint,Body,Events,Mouse,MouseConstraint,Vector} = Matter;
+
+    // ==== 画像（固定ファイルを自動読込） ======================
+    // 同フォルダに ball.jpg / target.jpg を置く
+    const textures = { ball:null, target:null };
+    const ballImg = new Image(); ballImg.onload = ()=>{ textures.ball = ballImg; if(projectile) projectile.render.opacity=0; }; ballImg.src = 'ball.jpg';
+    const targetImg = new Image(); targetImg.onload = ()=>{ textures.target = targetImg; }; targetImg.src = 'target.jpg';
+    // ===========================================================
+
+    // ==== SFX & BGM（WebAudio） ================================
+    const AudioCtx = window.AudioContext || window.webkitAudioContext;
+    const audio = new AudioCtx();
+    function envGain(duration=0.25, attack=0.002, release=0.18, peak=0.9){
+      const g=audio.createGain(), t=audio.currentTime;
+      g.gain.setValueAtTime(0,t); g.gain.linearRampToValueAtTime(peak,t+attack);
+      g.gain.exponentialRampToValueAtTime(0.0001,t+duration); g.connect(audio.destination); return g;
+    }
+    function oscBeep({freq=440,dur=0.15,type='sine',vol=0.5,slide=0}={}){
+      const o=audio.createOscillator(), g=envGain(dur,0.005,Math.max(0.05,dur*0.8),vol), t=audio.currentTime;
+      o.type=type; o.frequency.setValueAtTime(freq,t); if(slide) o.frequency.linearRampToValueAtTime(freq+slide,t+dur*0.9);
+      o.connect(g); o.start(t); o.stop(t+dur);
+    }
+    function noiseBurst({dur=0.35,vol=0.6,hp=600,lp=5500}={}){
+      const n=audio.createBuffer(1,audio.sampleRate,audio.sampleRate), d=n.getChannelData(0);
+      for(let i=0;i<d.length;i++) d[i]=(Math.random()*2-1)*Math.pow(1-i/d.length,2);
+      const src=audio.createBufferSource(); src.buffer=n;
+      const hpf=audio.createBiquadFilter(); hpf.type='highpass'; hpf.frequency.value=hp;
+      const lpf=audio.createBiquadFilter(); lpf.type='lowpass';  lpf.frequency.value=lp;
+      const g=envGain(dur,0.002,dur*0.85,vol); src.connect(hpf); hpf.connect(lpf); lpf.connect(g);
+      const t=audio.currentTime; src.start(t); src.stop(t+dur);
+    }
+    function thunk({base=180,dur=0.18,vol=0.45}={}){ oscBeep({freq:base,dur,type:'square',vol,slide:-base*0.35}); }
+    function twang(power=1){ const f=260+280*power; oscBeep({freq:f,dur=0.14,type:'triangle',vol:0.35,slide:-f*0.45}); }
+    function uiClick(){ oscBeep({freq:1200,dur=0.05,type:'square',vol:0.25}); }
+    function fanfare(){ oscBeep({freq:740,dur:0.22,type:'square',vol:0.3}); setTimeout(()=>oscBeep({freq:988,dur:0.24,type:'square',vol:0.3}),120); }
+    document.addEventListener('pointerdown', ()=>{ if(audio.state==='suspended') audio.resume(); }, {once:true});
+
+    // ループBGM（超軽量シンセ、ONボタンで開始/停止）
+    let bgmNodes=null, bgmOn=false;
+    function startBGM(){
+      if (bgmOn) return;
+      const master = audio.createGain(); master.gain.value=0.18; master.connect(audio.destination);
+      // パッド和音
+      const pad = audio.createOscillator(); pad.type='sine';
+      const gPad = audio.createGain(); gPad.gain.value=0.08; pad.connect(gPad); gPad.connect(master); pad.start();
+      // 8分 arpeggio
+      const lead = audio.createOscillator(); lead.type='triangle';
+      const gLead = audio.createGain(); gLead.gain.value=0.045; lead.connect(gLead); gLead.connect(master); lead.start();
+      let i=0; const seq=[220.0,277.18, A=246.94, C=261.63, E=329.63, G=392.00].map(v=>v); // A–C–E–G進行
+      const bar = Math.floor(4*audio.sampleRate/8); let step=0;
+      const id = setInterval(()=>{ const t=audio.currentTime;
+        // パッド動作（ゆっくり）
+        const pf = [174.61, 220.00, A, 220.00][i%4]; pad.frequency.setTargetAtTime(pf, t, 0.4);
+        // リード（8分音符）
+        const f2 = seq[(step++)%seq.length]; lead.frequency.setTargetAtTime(f2*1.125, audio.currentTime, 0.05);
+        if(step%8===0) i++;
+      }, 125);
+      bgmNodes={master,pad,lead,id}; bgmOn=true;
+      document.getElementById('bgm').textContent='BGM OFF';
+    }
+    function stopBGM(){
+      if (!bgmOn || !bgmNodes) return;
+      const t=audio.currentTime;
+      bgmNodes.master.gain.setTargetAtTime(0,t,0.2);
+      setTimeout(()=>{
+        bgmNodes.pad.stop(); bgmNodes.lead.stop(); clearInterval(bgmNodes.id);
+        bgmNodes=null; bgmOn=false;
+        document.getElementById('bgm').textContent='BGM ON';
+      }, 400);
+    }
+    document.getElementById('bgm').addEventListener('click',()=>{ (bgmOn?stopBGM:startBGM)(); });
+
+    // ==========================================================
+
+    // 衝突カテゴリ
+    const CF={WORLD:0x0001,PROJECTILE:0x0002,BLOCK:0x0004,PARTICLE:0x0008,TARGET:0x0010};
+
+    // エンジン（安定化）
+    const engine=Engine.create(), world=engine.world;
+    engine.positionIterations=8; engine.velocityIterations=6;
+    world.gravity.y=1.05;
+
+    let W=innerWidth, H=innerHeight;
+
+    // 遠目表示
+    const ZOOM=1.8;
+    const render=Render.create({
+      element:document.body, engine,
+      options:{ width:W,height:H,wireframes:false,background:'#0e1012',
+        pixelRatio:Math.min(devicePixelRatio||1,1.75), hasBounds:true }
+    });
+    Render.run(render);
+    const runner=Runner.create(); Runner.run(runner,engine);
+
+    function applyZoomOut(){
+      const cx=W/2, cy=H/2, halfW=(W*ZOOM)/2, halfH=(H*ZOOM)/2;
+      render.bounds.min.x=cx-halfW; render.bounds.max.x=cx+halfW;
+      render.bounds.min.y=cy-halfH; render.bounds.max.y=cy+halfH; syncMouseScale();
+    }
+    function toScreen(x,y){
+      const b=render.bounds, w=render.options.width, h=render.options.height;
+      return {x:(x-b.min.x)/(b.max.x-b.min.x)*w, y:(y-b.min.y)/(b.max.y-b.min.y)*h};
+    }
+    function sx(){ return render.options.width /(render.bounds.max.x-render.bounds.min.x); }
+    function sy(){ return render.options.height/(render.bounds.max.y-render.bounds.min.y); }
+
+    // 壁（床なし）
+    const T=80, DEPTH_FACTOR=3;
+    const wallMat={isStatic:true,restitution:1.0,friction:0,frictionStatic:0,collisionFilter:{category:CF.WORLD}};
+    let leftW,rightW,deepLimitY=0;
+    function buildWorldBounds(){
+      const wallH=H*DEPTH_FACTOR, wallY=wallH/2; deepLimitY=H*DEPTH_FACTOR;
+      if(leftW) World.remove(world,[leftW,rightW]);
+      leftW=Bodies.rectangle(-T/2,wallY,T,wallH,{...wallMat,render:{fillStyle:'#14171b'}});
+      rightW=Bodies.rectangle(W+T/2,wallY,T,wallH,{...wallMat,render:{fillStyle:'#14171b'}});
+      World.add(world,[leftW,rightW]);
+    }
+    buildWorldBounds();
+
+    // 土台（摩擦UP）
+    let platform;
+    const buildPlatform=()=>{
+      if(platform) World.remove(world,platform);
+      const pw=Math.min(520,Math.max(320,W*0.38));
+      platform=Bodies.rectangle(W*0.65,H-60,pw,24,{isStatic:true,friction:0.9,frictionStatic:1.2,collisionFilter:{category:CF.WORLD},render:{fillStyle:'#22262c'}});
+      World.add(world,platform);
+    };
+    buildPlatform();
+
+    // 落下センサー
+    const sensor=Bodies.rectangle(W/2,H-10,W*1.2,20,{isStatic:true,isSensor:true,collisionFilter:{category:CF.WORLD},render:{visible:false}});
+    World.add(world,sensor);
+
+    // 状態/UI
+    const colors=["#8ab4f8","#f28b82","#fdd663","#81c995","#c58af9","#7fd1f0","#f7a9cf"];
+    let blocks=[],targets=[],level=1,score=0,shots=0;
+    const scoreEl=document.getElementById('score'), shotsEl=document.getElementById('shots'), levelEl=document.getElementById('level'), targetsEl=document.getElementById('targetsLeft'), toastEl=document.getElementById('toast');
+
+    // 通常ブロック
+    const makeBlock=(w,h,x,y)=>Bodies.rectangle(x,y,w,h,{
+      chamfer:{radius:6}, friction:0.6, frictionStatic:1.0, restitution:0.02, density:0.0035,
+      collisionFilter:{category:CF.BLOCK,mask:CF.WORLD|CF.PROJECTILE|CF.BLOCK|CF.TARGET},
+      render:{fillStyle:colors[Math.floor(Math.random()*colors.length)]}
+    });
+
+    // ターゲット：黒塗り（写真は afterRender で貼る）
+    const makeTargetRect=(w,h,x,y)=>Bodies.rectangle(x,y,w,h,{
+      chamfer:0, friction:0.6, frictionStatic:1.0, restitution:0.02, density:0.0038,
+      collisionFilter:{category:CF.TARGET,mask:CF.WORLD|CF.PROJECTILE|CF.BLOCK|CF.TARGET},
+      render:{ fillStyle:"#000000" }
+    });
+
+    // タワー生成（縦2段ターゲット）
+    const buildTower=(lv=1)=>{
+      for(const b of blocks) World.remove(world,b);
+      for(const t of targets) World.remove(world,t);
+      blocks=[]; targets=[];
+      const cols=Math.min(6,3+((lv-1)/2|0)), rows=Math.min(18,8+(lv-1)*2);
+      const bw=Math.max(30,Math.min(90,(platform.bounds.max.x-platform.bounds.min.x-60)/cols));
+      const bh=Math.max(18,Math.min(32,24+Math.floor(Math.random()*6)));
+      const baseX=platform.position.x, baseY=platform.position.y-24-bh/2;
+      const targetRatio=0.10, gapX=0.5, gapY=0.5;
+
+      const cellCenter=(r,c)=>({x:baseX-(cols-1)*bw/2 + c*bw, y:baseY - r*(bh+2)});
+      const used=Array.from({length:rows},()=>Array(cols).fill(false));
+
+      for(let r=0;r<rows-1;r++){
+        for(let c=0;c<cols;c++){
+          if(Math.random()>=targetRatio || used[r][c] || used[r+1][c]) continue;
+          const ctr=cellCenter(r,c), h=2*(bh-gapY)-2, w=(bw-4-gapX);
+          const cy=(cellCenter(r,c).y + cellCenter(r+1,c).y)/2;
+          targets.push(makeTargetRect(w,h,ctr.x,cy));
+          used[r][c]=used[r+1][c]=true;
+        }
+      }
+      if(targets.length===0 && rows>=2){
+        const c=Math.floor(cols/2), r=Math.min(1,rows-2);
+        const ctr=cellCenter(r,c), h=2*(bh-gapY)-2, w=(bw-4-gapX);
+        const cy=(cellCenter(r,c).y + cellCenter(r+1,c).y)/2;
+        targets.push(makeTargetRect(w,h,ctr.x,cy));
+        used[r][c]=used[r+1][c]=true;
+      }
+      for(let r=0;r<rows;r++){
+        for(let c=0;c<cols;c++){
+          if(used[r][c]) continue;
+          const ctr=cellCenter(r,c);
+          blocks.push(makeBlock(bw-4-gapX,bh-gapY,ctr.x,ctr.y));
+          used[r][c]=true;
+        }
+      }
+
+      World.add(world,[...blocks,...targets]);
+
+      // 自壊防止（瞬間静的→解除）
+      const all=[...blocks,...targets]; for(const b of all) Body.setStatic(b,true);
+      setTimeout(()=>{ for(const b of all) Body.setStatic(b,false); },250);
+
+      targetsEl.textContent=targets.length;
+    };
+
+    // スリング＆弾
+    const anchor={x:Math.max(160,W*0.24),y:Math.min(H-140,H-160)};
+    let projectile=null, elastic=null;
+    const GRAB_RANGE=200;
+    let grabProxy=null, grabLink=null;
+
+    // 後方ストローク最大長
+    let maxPull=anchor.x;
+    function recalcMaxPull(){
+      const innerFaceX=leftW.position.x+T/2;
+      const r=projectile?projectile.circleRadius:39;
+      maxPull=anchor.x - (innerFaceX + r);
+      if(maxPull<40) maxPull=40;
+    }
+
+    function createProjectile(){
+      projectile=Bodies.circle(anchor.x,anchor.y,39,{
+        density:0.014, frictionAir:0.013, restitution:.30, friction:.07,
+        collisionFilter:{category:CF.PROJECTILE,mask:CF.WORLD|CF.BLOCK|CF.TARGET|CF.PROJECTILE},
+        render:{fillStyle:"#e8eaed",strokeStyle:"#000",lineWidth:1.4, opacity:textures.ball?0:1}
+      });
+      // ゴム（少し弱め）
+      elastic=Constraint.create({pointA:anchor,bodyB:projectile,stiffness:.035,damping:.04,render:{visible:false}});
+
+      grabProxy=Bodies.circle(anchor.x,anchor.y,GRAB_RANGE,{isSensor:true,collisionFilter:{category:CF.PROJECTILE,mask:CF.PROJECTILE},render:{visible:false}});
+      grabLink=Constraint.create({bodyA:grabProxy,bodyB:projectile,length:0,stiffness:1,render:{visible:false}});
+      World.add(world,[projectile,elastic,grabProxy,grabLink]);
+      recalcMaxPull();
+      if(textures.ball) projectile.render.opacity=0;
+    }
+    createProjectile();
+
+    // マウス/タッチ
+    const mouse=Mouse.create(render.canvas);
+    const mctl=MouseConstraint.create(engine,{mouse,constraint:{stiffness:.12,render:{visible:false}},collisionFilter:{mask:CF.PROJECTILE}});
+    World.add(world,mctl); render.mouse=mouse;
+    function syncMouseScale(){
+      const kx=sx(), ky=sy(); mouse.scale.x=kx; mouse.scale.y=ky; mouse.pixelRatio=render.options.pixelRatio;
+    }
+
+    // ゴム描画
+    Events.on(render,'beforeRender',()=>{
+      if(!projectile) return;
+      const ctx=render.context, a=toScreen(anchor.x,anchor.y), b=toScreen(projectile.position.x,projectile.position.y);
+      ctx.save(); ctx.strokeStyle='#5f9cf4'; ctx.lineWidth=3; ctx.globalAlpha=.9;
+      ctx.beginPath(); ctx.moveTo(a.x,a.y); ctx.lineTo(b.x,b.y); ctx.stroke(); ctx.restore();
+    });
+
+    // 画像の自前描画
+    Events.on(render,'afterRender',()=>{
+      const ctx=render.context;
+      if(textures.ball && projectile){
+        const pos=toScreen(projectile.position.x,projectile.position.y);
+        const d=projectile.circleRadius*2 * sx();
+        ctx.save(); ctx.beginPath(); ctx.arc(pos.x,pos.y,d/2,0,Math.PI*2); ctx.clip();
+        ctx.drawImage(textures.ball,pos.x-d/2,pos.y-d/2,d,d); ctx.restore();
+      }
+      if(textures.target && targets.length){
+        for(const t of targets){
+          const pos=toScreen(t.position.x,t.position.y);
+          const w=(t.bounds.max.x - t.bounds.min.x)*sx();
+          const h=(t.bounds.max.y - t.bounds.min.y)*sy();
+          ctx.save(); ctx.translate(pos.x,pos.y); ctx.rotate(t.angle);
+          ctx.drawImage(textures.target,-w/2,-h/2,w,h);
+          ctx.restore();
+        }
+      }
+    });
+
+    // 爆発
+    function explodeAt(pos,radius=170,power=0.038){
+      const all=blocks.concat(targets);
+      for(const body of all){
+        const d=Vector.magnitude(Vector.sub(body.position,pos));
+        if(d<radius){
+          const f=(1-d/radius)*power*body.mass, dir=Vector.normalise(Vector.sub(body.position,pos));
+          Body.applyForce(body,body.position,Vector.mult(dir,f));
+        }
+      }
+      const palette=['#ff6b3d','#ff9640','#ffc14d','#ffe066']; const parts=[];
+      const cnt=(innerWidth<700)?18:30;
+      for(let i=0;i<cnt;i++){
+        const ang=Math.random()*Math.PI*2, sp=3+Math.random()*7, r=2.5+Math.random()*3.5;
+        const color=palette[Math.floor(Math.random()*palette.length)];
+        const p=Bodies.circle(pos.x,pos.y,r,{frictionAir:0.02,restitution:0.6,density:0.0005,collisionFilter:{category:CF.PARTICLE,mask:CF.WORLD|CF.BLOCK|CF.TARGET},render:{fillStyle:color}});
+        Body.setVelocity(p,{x:Math.cos(ang)*sp,y:Math.sin(ang)*sp-1}); parts.push(p);
+      }
+      World.add(world,parts); setTimeout(()=>{ for(const p of parts) World.remove(world,p); },900);
+      let t=0,id=null;(function shake(){ t++; render.canvas.style.transform=`translate(${(Math.random()-0.5)*6}px,${(Math.random()-0.5)*6}px)`; if(t>12){render.canvas.style.transform=''; cancelAnimationFrame(id);} else {id=requestAnimationFrame(shake);} })();
+      noiseBurst({dur:0.35,vol:0.45,hp:500,lp:6000}); thunk({base:140,dur:0.22,vol:0.35});
+    }
+
+    // 発射/判定（こすれ音対策：1回のみ）
+    let dragging=false, launched=false, impacted=false;
+    let reloadTimer=null, restFrames=0;
+    let hitOnce=new Set(), worldHitPlayed=false;
+
+    function scheduleReload(ms=3000){ if(!reloadTimer) reloadTimer=setTimeout(()=>reload(),ms); }
+
+    Events.on(mctl,'startdrag',e=>{
+      if(e.body===projectile || e.body===grabProxy){
+        dragging=true; projectile.isSensor=true; projectile.collisionFilter.mask=CF.WORLD;
+      }
+    });
+    Events.on(mctl,'enddrag',e=>{
+      if(dragging && (e.body===projectile || e.body===grabProxy)){
+        setTimeout(()=>{
+          elastic.bodyB=null; dragging=false; launched=true; impacted=false; restFrames=0;
+          shots++; shotsEl.textContent=shots; mctl.collisionFilter.mask=0;
+          projectile.isSensor=false; projectile.collisionFilter.mask=CF.WORLD|CF.BLOCK|CF.TARGET|CF.PROJECTILE;
+          hitOnce.clear(); worldHitPlayed=false;
+          twang(Math.min(1,(maxPull||200)/200));
+        },0);
+      }
+    });
+
+    // ドラッグ中クランプ（後方のみ）
+    Events.on(engine,'beforeUpdate',()=>{
+      if(!dragging) return;
+      const r=projectile.circleRadius, minX=(leftW.position.x+T/2)+r+0.001;
+      let pos={x:projectile.position.x,y:projectile.position.y};
+      if(pos.x>anchor.x) pos.x=anchor.x; if(pos.x<minX) pos.x=minX;
+      let v=Vector.sub(pos,anchor), len=Vector.magnitude(v);
+      if(len>maxPull){ v=Vector.mult(Vector.normalise(v),maxPull); pos=Vector.add(anchor,v); }
+      Body.setPosition(projectile,pos); Body.setVelocity(projectile,{x:0,y:0});
+      if(grabProxy) Body.setPosition(grabProxy,pos);
+    });
+
+    // 範囲外/停止監視
+    Events.on(engine,'afterUpdate',()=>{
+      if(launched && !impacted){
+        const v2=projectile.velocity.x**2+projectile.velocity.y**2;
+        restFrames = v2<0.25 ? restFrames+1 : 0;
+        if(restFrames>90) scheduleReload(3000);
+      }
+      if(launched){
+        const x=projectile.position.x, y=projectile.position.y;
+        const outLeft=x<-T*2, outRight=x>W+T*2, outAbove=y<-H*0.8, outBelow=y>(deepLimitY+200);
+        if(outLeft||outRight||outAbove||outBelow) scheduleReload(1500);
+      }
+    });
+
+    // 衝突（各ブロック1回・壁1回だけ音）
+    Events.on(engine,'collisionStart',ev=>{
+      if(!launched) return;
+      for(const p of ev.pairs){
+        const a=p.bodyA,b=p.bodyB; const hitProj=(a===projectile||b===projectile); if(!hitProj) continue;
+        const other=(a===projectile?b:a), cat=other?.collisionFilter?.category;
+        const speed=Math.hypot(projectile.velocity.x,projectile.velocity.y), pow=Math.min(1,speed/20);
+        if(cat===CF.BLOCK||cat===CF.TARGET){
+          if(!hitOnce.has(other.id)){ hitOnce.add(other.id); thunk({base:180+80*pow,vol:0.25+0.35*pow,dur:0.12+0.12*pow}); }
+        }else if(cat===CF.WORLD){
+          if(!worldHitPlayed){ worldHitPlayed=true; thunk({base:140+60*pow,vol:0.2+0.25*pow,dur:0.12+0.12*pow}); }
+        }
+        const isB=(cat===CF.BLOCK), isT=(cat===CF.TARGET), isW=(cat===CF.WORLD);
+        if((isB||isT) && !impacted){ impacted=true; explodeAt(projectile.position,170,0.038); scheduleReload(3000); break; }
+        if(isW && !impacted){ scheduleReload(3000); }
+      }
+    });
+
+    // スコア/クリア（落下）
+    const gone=new Set();
+    function onFallen(body){
+      if(gone.has(body.id)) return; gone.add(body.id);
+      thunk({base:120,vol:0.28,dur:0.18});
+      score+=5; scoreEl.textContent=score;
+      if(body.collisionFilter.category===CF.TARGET){
+        targets=targets.filter(t=>t.id!==body.id); targetsEl.textContent=targets.length;
+        oscBeep({freq:660,dur:0.12,type:'triangle',vol:0.28});
+        if(targets.length===0){ toast('Stage Clear!'); fanfare(); setTimeout(()=>{ level=Math.min(12,level+1); levelEl.textContent=level; reset(); },1500); }
+      }
+      body.render.opacity=.6; setTimeout(()=>World.remove(world,body),300);
+    }
+    Events.on(engine,'collisionStart',ev=>{
+      for(const p of ev.pairs){
+        const a=p.bodyA,b=p.bodyB; const obj=(a===sensor?b:(b===sensor?a:null));
+        if(obj && (blocks.includes(obj)||targets.includes(obj))) onFallen(obj);
+      }
+    });
+
+    // リロード
+    const reload=()=>{
+      clearTimeout(reloadTimer); reloadTimer=null;
+      if(projectile) World.remove(world,projectile);
+      if(grabProxy) World.remove(world,grabProxy);
+      if(grabLink)  World.remove(world,grabLink);
+
+      projectile=Bodies.circle(anchor.x,anchor.y,39,{
+        density:0.014, frictionAir:0.013, restitution:.30, friction:.07,
+        collisionFilter:{category:CF.PROJECTILE,mask:CF.WORLD|CF.BLOCK|CF.TARGET|CF.PROJECTILE},
+        render:{fillStyle:"#e8eaed",strokeStyle:"#000",lineWidth:1.4, opacity:textures.ball?0:1}
+      });
+      elastic.bodyB=projectile;
+      grabProxy=Bodies.circle(anchor.x,anchor.y,GRAB_RANGE,{isSensor:true,collisionFilter:{category:CF.PROJECTILE,mask:CF.PROJECTILE},render:{visible:false}});
+      grabLink=Constraint.create({bodyA:grabProxy,bodyB:projectile,length:0,stiffness:1,render:{visible:false}});
+      World.add(world,[projectile,grabProxy,grabLink]);
+
+      launched=false; impacted=false; restFrames=0; mctl.collisionFilter.mask=CF.PROJECTILE;
+      hitOnce.clear(); worldHitPlayed=false;
+      recalcMaxPull();
+      oscBeep({freq:520,dur:0.08,type:'triangle',vol:0.22});
+    };
+
+    // トースト
+    function toast(msg){
+      toastEl.textContent=msg; toastEl.style.display='block'; toastEl.style.opacity='0';
+      toastEl.style.transition='opacity .2s ease';
+      requestAnimationFrame(()=> toastEl.style.opacity='1');
+      setTimeout(()=>{ toastEl.style.opacity='0'; setTimeout(()=>toastEl.style.display='none',200); },900);
+    }
+
+    // ボタン
+    const reset=()=>{
+      score=0; shots=0; document.getElementById('score').textContent=0; document.getElementById('shots').textContent=0;
+      const keep=new Set([leftW.id,rightW.id,platform.id,sensor.id]);
+      for(const b of Composite.allBodies(world)){ if(!keep.has(b.id)) World.remove(world,b); }
+      buildPlatform(); buildTower(level); createProjectile();
+      launched=false; impacted=false; restFrames=0; clearTimeout(reloadTimer); reloadTimer=null;
+      mctl.collisionFilter.mask=CF.PROJECTILE; applyZoomOut(); gone.clear(); recalcMaxPull();
+    };
+    const same=()=>reset();
+    const next=()=>{ level=Math.min(12,level+1); levelEl.textContent=level; reset(); };
+    document.getElementById('reset').onclick=()=>{ uiClick(); reset(); };
+    document.getElementById('rebuild').onclick=()=>{ uiClick(); same(); };
+    document.getElementById('next').onclick=()=>{ uiClick(); next(); };
+
+    // リサイズ
+    addEventListener('resize',()=>{
+      W=innerWidth; H=innerHeight;
+      render.options.width=W; render.options.height=H; render.canvas.width=W; render.canvas.height=H;
+      buildWorldBounds(); Body.setPosition(sensor,{x:W/2,y:H-10}); buildPlatform();
+      anchor.x=Math.max(160,W*0.24); anchor.y=Math.min(H-140,H-160);
+      if(!launched && projectile){ Body.setPosition(projectile,{x:anchor.x,y:anchor.y}); if(grabProxy) Body.setPosition(grabProxy,{x:anchor.x,y:anchor.y}); }
+      applyZoomOut(); recalcMaxPull();
+    });
+
+    // 起動
+    buildTower(level); applyZoomOut(); recalcMaxPull();
+  })();
+  </script>
+</body>
+</html>

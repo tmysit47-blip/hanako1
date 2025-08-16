@@ -1,61 +1,34 @@
-// キャッシュ名は更新のたびに変えること
-const CACHE_NAME = 'tower-v8';
+// 版数を上げるとキャッシュ更新されます
+const CACHE_NAME = "tower-v7";
 const ASSETS = [
-  './',
-  './index.html',
-  './matter.min.js',
-  './service-worker.js',
-  './manifest.webmanifest',
-  // 画像があれば一緒にキャッシュ（無ければ消してOK）
-  './ball.jpg',
-  './target.jpg',
+  "./",
+  "./index.html",
+  "./matter.min.js",
+  "./manifest.webmanifest",
+  "./ball.jpg",
+  "./target.jpg",
 ];
 
-self.addEventListener('install', (e) => {
-  self.skipWaiting();
+self.addEventListener("install", (e) => {
+  e.waitUntil(caches.open(CACHE_NAME).then((c) => c.addAll(ASSETS)));
+});
+
+self.addEventListener("activate", (e) => {
   e.waitUntil(
-    caches.open(CACHE_NAME).then((cache) => cache.addAll(ASSETS))
+    caches.keys().then(keys =>
+      Promise.all(keys.filter(k => k !== CACHE_NAME).map(k => caches.delete(k)))
+    )
   );
 });
 
-self.addEventListener('activate', (e) => {
-  e.waitUntil((async () => {
-    const keys = await caches.keys();
-    await Promise.all(keys.map((k) => (k === CACHE_NAME ? null : caches.delete(k))));
-    await self.clients.claim();
-  })());
-});
-
-self.addEventListener('fetch', (e) => {
-  const req = e.request;
-
-  // HTMLはネット優先＋失敗時キャッシュ
-  if (req.mode === 'navigate') {
-    e.respondWith((async () => {
-      try {
-        const fresh = await fetch(req);
-        const cache = await caches.open(CACHE_NAME);
-        cache.put(req, fresh.clone());
-        return fresh;
-      } catch {
-        const cached = await caches.match(req);
-        return cached || caches.match('./index.html');
-      }
-    })());
-    return;
-  }
-
-  // その他はキャッシュ優先
-  e.respondWith((async () => {
-    const cached = await caches.match(req);
-    if (cached) return cached;
-    try {
-      const fresh = await fetch(req);
-      const cache = await caches.open(CACHE_NAME);
-      cache.put(req, fresh.clone());
-      return fresh;
-    } catch {
-      return cached;
-    }
-  })());
+self.addEventListener("fetch", (e) => {
+  const { request } = e;
+  // 優先: キャッシュ → ネット（オフライン可）
+  e.respondWith(
+    caches.match(request).then(res => res || fetch(request).then(r => {
+      const copy = r.clone();
+      caches.open(CACHE_NAME).then(c => c.put(request, copy)).catch(()=>{});
+      return r;
+    }).catch(() => caches.match("./index.html")))
+  );
 });

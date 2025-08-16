@@ -15,7 +15,7 @@
   #hint{position:fixed;left:12px;bottom:12px;background:#121418aa;border:1px solid #272c35;border-radius:8px;padding:.4rem .6rem;opacity:.9}
   #toast{position:fixed;left:50%;top:14%;transform:translateX(-50%);padding:.6rem 1rem;border-radius:10px;background:#11151bdd;border:1px solid #2b3240;display:none;z-index:20}
   canvas{display:block;touch-action:none}
-  /* 画面内デバッグ表示（必要時のみ出る） */
+  /* 画面内エラー表示（必要時のみ出る） */
   #err{position:fixed;left:10px;right:10px;bottom:10px;background:#3b0b0b;border:1px solid #aa5555;color:#ffdede;padding:.6rem .8rem;border-radius:10px;z-index:9999;white-space:pre-wrap}
 </style>
 </head>
@@ -35,40 +35,49 @@
   <div id="hint">黒い“縦2段ターゲット”を全部落とすとクリア！ 弾はドラッグ→離すで発射。</div>
   <div id="toast">Stage Clear!</div>
 
-  <!-- 1) まずローカルの matter.min.js を読み込む（同じフォルダに置く） -->
+  <!-- ローカルの matter.min.js（同じフォルダに配置） -->
   <script src="./matter.min.js"></script>
 
-  <!-- 2) もし Matter が読めてない場合は画面に理由を出して止める -->
+  <!-- Matter が読めてない場合の停止＆案内 -->
   <script>
     if(!window.Matter){
       document.body.insertAdjacentHTML('beforeend',
         '<div id="err">matter.min.js が読み込めていません。\\n' +
-        '・ファイルを index.html と同じフォルダに置く\\n' +
+        '・index.html と同じフォルダに置く\\n' +
         '・ファイル名は「matter.min.js」（大文字小文字も一致）\\n' +
-        '・GitHub Pages の場合はアップ後にキャッシュ更新が必要\\n' +
-        '  → service-worker.js の CACHE_NAME を上げて再読み込み</div>');
+        '・GitHub Pages なら push 後にキャッシュ更新が必要（service-worker.js の CACHE_NAME を更新）</div>');
       throw new Error('Matter not loaded');
     }
   </script>
 
-  <!-- 3) Service Worker（PWA）登録 -->
+  <!-- Service Worker（PWA/オフライン）登録 -->
   <script>
     if ('serviceWorker' in navigator) {
       addEventListener('load', () => navigator.serviceWorker.register('./service-worker.js'));
     }
   </script>
 
-  <!-- 4) ここからゲーム本体（あなたの安定版） -->
+  <!-- ゲーム本体 -->
   <script>
   (()=> {
     const {Engine,Render,Runner,World,Bodies,Composite,Constraint,Body,Events,Mouse,MouseConstraint,Vector} = Matter;
 
-    // ==== 画像（任意）同フォルダに ball.jpg / target.jpg ====
+    // ===== 画像（同フォルダに ball.jpg / target.jpg があれば貼る） =====
     const textures = { ball:null, target:null };
     const ballImg = new Image(); ballImg.onload = ()=>{ textures.ball = ballImg; if(projectile) projectile.render.opacity=0; }; ballImg.src = 'ball.jpg';
     const targetImg = new Image(); targetImg.onload = ()=>{ textures.target = targetImg; }; targetImg.src = 'target.jpg';
 
-    // ==== WebAudio：SFX + BGM =================================
+    // 画像を「cover」相当で矩形にフィットさせて描く（iPhoneの比率崩れ対策）
+    function drawImageCover(ctx, img, w, h){
+      const iw = img.naturalWidth || img.width, ih = img.naturalHeight || img.height;
+      if(!iw || !ih) return;
+      const s = Math.max(w/iw, h/ih);
+      const sw = w/s, sh = h/s;
+      const sx = (iw - sw)/2, sy = (ih - sh)/2;
+      ctx.drawImage(img, sx, sy, sw, sh, -w/2, -h/2, w, h);
+    }
+
+    // ===== WebAudio：SFX + BGM =====
     const AudioCtx = window.AudioContext || window.webkitAudioContext;
     const audio = new AudioCtx();
     function envGain(duration=0.25, attack=0.002, release=0.18, peak=0.9){
@@ -90,13 +99,16 @@
       const g=envGain(dur,0.002,dur*0.85,vol); src.connect(hpf); hpf.connect(lpf); lpf.connect(g);
       const t=audio.currentTime; src.start(t); src.stop(t+dur);
     }
-    function thunk({base=180,dur=0.18,vol=0.45}={}){ oscBeep({freq:base,dur:type='square',vol,slide:-base*0.35}); }
+    // ★バグ修正済み：ここ（type の渡し方）
+    function thunk({base=180,dur=0.18,vol=0.45}={}){ 
+      oscBeep({freq:base, dur, type:'square', vol, slide:-base*0.35});
+    }
     function twang(power=1){ const f=260+280*power; oscBeep({freq:f,dur:0.14,type:'triangle',vol:0.35,slide:-f*0.45}); }
     function uiClick(){ oscBeep({freq:1200,dur:0.05,type:'square',vol:0.25}); }
     function fanfare(){ oscBeep({freq:740,dur:0.22,type:'square',vol:0.3}); setTimeout(()=>oscBeep({freq:988,dur:0.24,type:'square',vol:0.3}),120); }
     addEventListener('pointerdown', ()=>{ if(audio.state==='suspended') audio.resume(); }, {once:true});
 
-    // ふんわりBGM（低音パッド＋上モノ、超軽量・ループ）
+    // ふんわりBGM（軽量ループ）
     let bgmOn=false, bgmNodes=null;
     function startBGM(){
       if (bgmOn) return;
@@ -118,7 +130,7 @@
     }
     document.getElementById('bgm').addEventListener('click',()=>{ (bgmOn?stopBGM:startBGM)(); });
 
-    // ===== 物理エンジンセットアップ =====
+    // ===== 物理エンジン =====
     const CF={WORLD:0x0001,PROJECTILE:0x0002,BLOCK:0x0004,PARTICLE:0x0008,TARGET:0x0010};
     const engine=Engine.create(), world=engine.world;
     engine.positionIterations=8; engine.velocityIterations=6;
@@ -128,7 +140,8 @@
     const ZOOM=1.8;
     const render=Render.create({
       element:document.body, engine,
-      options:{ width:W,height:H,wireframes:false,background:'#0e1012', pixelRatio:Math.min(devicePixelRatio||1,1.75), hasBounds:true }
+      options:{ width:W,height:H,wireframes:false,background:'#0e1012',
+        pixelRatio:Math.min(devicePixelRatio||1,1.75), hasBounds:true }
     });
     Render.run(render); const runner=Runner.create(); Runner.run(runner,engine);
 
@@ -273,7 +286,7 @@
       ctx.save(); ctx.strokeStyle='#5f9cf4'; ctx.lineWidth=3; ctx.globalAlpha=.9; ctx.beginPath(); ctx.moveTo(a.x,a.y); ctx.lineTo(b.x,b.y); ctx.stroke(); ctx.restore();
     });
 
-    // 画像の自前描画
+    // 画像の自前描画（ターゲットは cover で貼る）
     Events.on(render,'afterRender',()=>{
       const ctx=render.context;
       if(textures.ball && projectile){
@@ -288,7 +301,7 @@
           const w=(t.bounds.max.x - t.bounds.min.x)*sx();
           const h=(t.bounds.max.y - t.bounds.min.y)*sy();
           ctx.save(); ctx.translate(pos.x,pos.y); ctx.rotate(t.angle);
-          ctx.drawImage(textures.target,-w/2,-h/2,w,h);
+          drawImageCover(ctx, textures.target, w, h);
           ctx.restore();
         }
       }
@@ -456,7 +469,7 @@
     // 起動
     buildTower(level); applyZoomOut(); recalcMaxPull();
 
-    // 追加：実行中エラーハンドラ（画面に出す）
+    // 実行時エラーハンドラ（画面に出す）
     window.addEventListener('error', (e)=>{
       document.body.insertAdjacentHTML('beforeend', '<div id="err">エラー: '+ e.message +'</div>');
     });

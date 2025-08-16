@@ -1,11 +1,9 @@
-<!doctype html>
+<!doctype html> 
 <html lang="ja">
 <head>
 <meta charset="utf-8" />
 <meta name="viewport" content="width=device-width,initial-scale=1,user-scalable=no" />
 <title>崩れるタワー</title>
-<meta name="theme-color" content="#0e1012" />
-<link rel="manifest" href="manifest.webmanifest">
 <style>
   html,body{margin:0;height:100%;background:#0e1012;color:#e7e9ea;font-family:system-ui,Segoe UI,Roboto,Helvetica,Arial}
   #ui{position:fixed;left:12px;top:12px;display:flex;gap:.5rem;z-index:10;align-items:center}
@@ -15,8 +13,6 @@
   #hint{position:fixed;left:12px;bottom:12px;background:#121418aa;border:1px solid #272c35;border-radius:8px;padding:.4rem .6rem;opacity:.9}
   #toast{position:fixed;left:50%;top:14%;transform:translateX(-50%);padding:.6rem 1rem;border-radius:10px;background:#11151bdd;border:1px solid #2b3240;display:none;z-index:20}
   canvas{display:block;touch-action:none}
-  /* 画面内デバッグ表示（必要時のみ出る） */
-  #err{position:fixed;left:10px;right:10px;bottom:10px;background:#3b0b0b;border:1px solid #aa5555;color:#ffdede;padding:.6rem .8rem;border-radius:10px;z-index:9999;white-space:pre-wrap}
 </style>
 </head>
 <body>
@@ -24,7 +20,6 @@
     <button id="reset" class="btn">リセット</button>
     <button id="rebuild" class="btn">同じレベル</button>
     <button id="next" class="btn">次のレベル</button>
-    <button id="bgm" class="btn">BGM ON</button>
   </div>
   <div id="panel">
     <span>Lv.<span id="level">1</span></span>
@@ -34,43 +29,32 @@
   </div>
   <div id="hint">黒い“縦2段ターゲット”を全部落とすとクリア！ 弾はドラッグ→離すで発射。</div>
   <div id="toast">Stage Clear!</div>
-
-  <!-- 1) まずローカルの matter.min.js を読み込む（同じフォルダに置く） -->
   <script src="./matter.min.js"></script>
-
-  <!-- 2) もし Matter が読めてない場合は画面に理由を出して止める -->
-  <script>
-    if(!window.Matter){
-      document.body.insertAdjacentHTML('beforeend',
-        '<div id="err">matter.min.js が読み込めていません。\\n' +
-        '・ファイルを index.html と同じフォルダに置く\\n' +
-        '・ファイル名は「matter.min.js」（大文字小文字も一致）\\n' +
-        '・GitHub Pages の場合はアップ後にキャッシュ更新が必要\\n' +
-        '  → service-worker.js の CACHE_NAME を上げて再読み込み</div>');
-      throw new Error('Matter not loaded');
-    }
-  </script>
-
-  <!-- 3) Service Worker（PWA）登録 -->
-  <script>
-    if ('serviceWorker' in navigator) {
-      addEventListener('load', () => navigator.serviceWorker.register('./service-worker.js'));
-    }
-  </script>
-
-  <!-- 4) ここからゲーム本体（あなたの安定版） -->
   <script>
   (()=> {
     const {Engine,Render,Runner,World,Bodies,Composite,Constraint,Body,Events,Mouse,MouseConstraint,Vector} = Matter;
 
-    // ==== 画像（任意）同フォルダに ball.jpg / target.jpg ====
-    const textures = { ball:null, target:null };
-    const ballImg = new Image(); ballImg.onload = ()=>{ textures.ball = ballImg; if(projectile) projectile.render.opacity=0; }; ballImg.src = 'ball.jpg';
-    const targetImg = new Image(); targetImg.onload = ()=>{ textures.target = targetImg; }; targetImg.src = 'target.jpg';
+    /* === 追加：画像を cover で貼る小関数（比率崩れ防止） ================== */
+    function drawImageCover(ctx, img, w, h){
+      const iw = img.naturalWidth || img.width, ih = img.naturalHeight || img.height;
+      if(!iw || !ih) return;
+      const scale = Math.max(w/iw, h/ih);
+      const sw = w/scale, sh = h/scale;
+      const sx = (iw - sw)/2, sy = (ih - sh)/2;
+      ctx.drawImage(img, sx, sy, sw, sh, -w/2, -h/2, w, h);
+    }
+    /* ===================================================================== */
 
-    // ==== WebAudio：SFX + BGM =================================
+    // ==== 画像（固定ファイルを自動読込） ======================
+    // 同フォルダに ball.jpg（弾） / target.jpg（ターゲット）を置く
+    const textures = { ball:null, target:null };
+    const ballImg   = new Image(); ballImg.onload   = ()=>{ textures.ball   = ballImg; if(projectile) projectile.render.opacity=0; }; ballImg.src   = 'ball.jpg';
+    const targetImg = new Image(); targetImg.onload = ()=>{ textures.target = targetImg; };                targetImg.src = 'target.jpg';
+    // ===========================================================
+
+    // ==== SFX（WebAudio） =====================================
     const AudioCtx = window.AudioContext || window.webkitAudioContext;
-    const audio = new AudioCtx();
+    const audio = new AudioCtx(); let lastPlay=0;
     function envGain(duration=0.25, attack=0.002, release=0.18, peak=0.9){
       const g=audio.createGain(), t=audio.currentTime;
       g.gain.setValueAtTime(0,t); g.gain.linearRampToValueAtTime(peak,t+attack);
@@ -90,58 +74,46 @@
       const g=envGain(dur,0.002,dur*0.85,vol); src.connect(hpf); hpf.connect(lpf); lpf.connect(g);
       const t=audio.currentTime; src.start(t); src.stop(t+dur);
     }
-    function thunk({base=180,dur=0.18,vol=0.45}={}){ oscBeep({freq:base,dur:type='square',vol,slide:-base*0.35}); }
+    function thunk({base=180,dur=0.18,vol=0.45}={}){ oscBeep({freq:base,dur,type:'square',vol,slide:-base*0.35}); }
     function twang(power=1){ const f=260+280*power; oscBeep({freq:f,dur:0.14,type:'triangle',vol:0.35,slide:-f*0.45}); }
     function uiClick(){ oscBeep({freq:1200,dur:0.05,type:'square',vol:0.25}); }
     function fanfare(){ oscBeep({freq:740,dur:0.22,type:'square',vol:0.3}); setTimeout(()=>oscBeep({freq:988,dur:0.24,type:'square',vol:0.3}),120); }
-    addEventListener('pointerdown', ()=>{ if(audio.state==='suspended') audio.resume(); }, {once:true});
+    document.addEventListener('pointerdown', ()=>{ if(audio.state==='suspended') audio.resume(); }, {once:true});
+    // ==========================================================
 
-    // ふんわりBGM（低音パッド＋上モノ、超軽量・ループ）
-    let bgmOn=false, bgmNodes=null;
-    function startBGM(){
-      if (bgmOn) return;
-      const master=audio.createGain(); master.gain.value=0.18; master.connect(audio.destination);
-      const pad=audio.createOscillator(); const padGain=audio.createGain(); pad.type='sine'; padGain.gain.value=0.08; pad.connect(padGain); padGain.connect(master); pad.start();
-      const lead=audio.createOscillator(); const leadGain=audio.createGain(); lead.type='triangle'; leadGain.gain.value=0.045; lead.connect(leadGain); leadGain.connect(master); lead.start();
-      let i=0, step=0; const seq=[220.00,277.18,246.94,261.63,329.63,392.00];
-      const id=setInterval(()=>{ const t=audio.currentTime;
-        const pf=[174.61,220.00,246.94,220.00][i%4]; pad.frequency.setTargetAtTime(pf,t,0.4);
-        lead.frequency.setTargetAtTime(seq[(step++)%seq.length]*1.125, audio.currentTime, 0.05);
-        if(step%8===0) i++;
-      },125);
-      bgmNodes={master,pad,lead,id}; bgmOn=true; document.getElementById('bgm').textContent='BGM OFF';
-    }
-    function stopBGM(){
-      if(!bgmOn||!bgmNodes) return;
-      const t=audio.currentTime; bgmNodes.master.gain.setTargetAtTime(0,t,0.2);
-      setTimeout(()=>{ bgmNodes.pad.stop(); bgmNodes.lead.stop(); clearInterval(bgmNodes.id); bgmNodes=null; bgmOn=false; document.getElementById('bgm').textContent='BGM ON'; },400);
-    }
-    document.getElementById('bgm').addEventListener('click',()=>{ (bgmOn?stopBGM:startBGM)(); });
-
-    // ===== 物理エンジンセットアップ =====
+    // 衝突カテゴリ
     const CF={WORLD:0x0001,PROJECTILE:0x0002,BLOCK:0x0004,PARTICLE:0x0008,TARGET:0x0010};
+
+    // エンジン（安定化）
     const engine=Engine.create(), world=engine.world;
     engine.positionIterations=8; engine.velocityIterations=6;
     world.gravity.y=1.05;
 
     let W=innerWidth, H=innerHeight;
+
+    // 遠目表示
     const ZOOM=1.8;
     const render=Render.create({
       element:document.body, engine,
-      options:{ width:W,height:H,wireframes:false,background:'#0e1012', pixelRatio:Math.min(devicePixelRatio||1,1.75), hasBounds:true }
+      options:{ width:W,height:H,wireframes:false,background:'#0e1012',
+        pixelRatio:Math.min(devicePixelRatio||1,1.75), hasBounds:true }
     });
-    Render.run(render); const runner=Runner.create(); Runner.run(runner,engine);
+    Render.run(render);
+    const runner=Runner.create(); Runner.run(runner,engine);
 
     function applyZoomOut(){
       const cx=W/2, cy=H/2, halfW=(W*ZOOM)/2, halfH=(H*ZOOM)/2;
       render.bounds.min.x=cx-halfW; render.bounds.max.x=cx+halfW;
       render.bounds.min.y=cy-halfH; render.bounds.max.y=cy+halfH; syncMouseScale();
     }
-    function toScreen(x,y){ const b=render.bounds, w=render.options.width, h=render.options.height; return {x:(x-b.min.x)/(b.max.x-b.min.x)*w, y:(y-b.min.y)/(b.max.y-b.min.y)*h}; }
+    function toScreen(x,y){
+      const b=render.bounds, w=render.options.width, h=render.options.height;
+      return {x:(x-b.min.x)/(b.max.x-b.min.x)*w, y:(y-b.min.y)/(b.max.y-b.min.y)*h};
+    }
     function sx(){ return render.options.width /(render.bounds.max.x-render.bounds.min.x); }
     function sy(){ return render.options.height/(render.bounds.max.y-render.bounds.min.y); }
 
-    // 壁
+    // 壁（床なし）
     const T=80, DEPTH_FACTOR=3;
     const wallMat={isStatic:true,restitution:1.0,friction:0,frictionStatic:0,collisionFilter:{category:CF.WORLD}};
     let leftW,rightW,deepLimitY=0;
@@ -154,7 +126,7 @@
     }
     buildWorldBounds();
 
-    // 土台
+    // 土台（摩擦UP）
     let platform;
     const buildPlatform=()=>{
       if(platform) World.remove(world,platform);
@@ -173,20 +145,21 @@
     let blocks=[],targets=[],level=1,score=0,shots=0;
     const scoreEl=document.getElementById('score'), shotsEl=document.getElementById('shots'), levelEl=document.getElementById('level'), targetsEl=document.getElementById('targetsLeft'), toastEl=document.getElementById('toast');
 
-    // ブロック
+    // 通常ブロック
     const makeBlock=(w,h,x,y)=>Bodies.rectangle(x,y,w,h,{
       chamfer:{radius:6}, friction:0.6, frictionStatic:1.0, restitution:0.02, density:0.0035,
       collisionFilter:{category:CF.BLOCK,mask:CF.WORLD|CF.PROJECTILE|CF.BLOCK|CF.TARGET},
       render:{fillStyle:colors[Math.floor(Math.random()*colors.length)]}
     });
-    // ターゲット
+
+    // ★ターゲット：黒塗り（写真は afterRender で貼る）
     const makeTargetRect=(w,h,x,y)=>Bodies.rectangle(x,y,w,h,{
       chamfer:0, friction:0.6, frictionStatic:1.0, restitution:0.02, density:0.0038,
       collisionFilter:{category:CF.TARGET,mask:CF.WORLD|CF.PROJECTILE|CF.BLOCK|CF.TARGET},
-      render:{ fillStyle:"#000000" }
+      render:{ fillStyle:"#000000" } // 枠なし黒
     });
 
-    // タワー
+    // タワー（縦2段ターゲット／Lv1は必ず1個）
     const buildTower=(lv=1)=>{
       for(const b of blocks) World.remove(world,b);
       for(const t of targets) World.remove(world,t);
@@ -200,6 +173,7 @@
       const cellCenter=(r,c)=>({x:baseX-(cols-1)*bw/2 + c*bw, y:baseY - r*(bh+2)});
       const used=Array.from({length:rows},()=>Array(cols).fill(false));
 
+      // 縦2段ターゲット配置
       for(let r=0;r<rows-1;r++){
         for(let c=0;c<cols;c++){
           if(Math.random()>=targetRatio || used[r][c] || used[r+1][c]) continue;
@@ -209,6 +183,7 @@
           used[r][c]=used[r+1][c]=true;
         }
       }
+      // 1個も置けなければ中央付近に強制配置
       if(targets.length===0 && rows>=2){
         const c=Math.floor(cols/2), r=Math.min(1,rows-2);
         const ctr=cellCenter(r,c), h=2*(bh-gapY)-2, w=(bw-4-gapX);
@@ -216,6 +191,7 @@
         targets.push(makeTargetRect(w,h,ctr.x,cy));
         used[r][c]=used[r+1][c]=true;
       }
+      // 残りセルに通常ブロック
       for(let r=0;r<rows;r++){
         for(let c=0;c<cols;c++){
           if(used[r][c]) continue;
@@ -224,19 +200,23 @@
           used[r][c]=true;
         }
       }
+
       World.add(world,[...blocks,...targets]);
 
+      // 自壊防止：一瞬静的化→解除
       const all=[...blocks,...targets]; for(const b of all) Body.setStatic(b,true);
       setTimeout(()=>{ for(const b of all) Body.setStatic(b,false); },250);
+
       targetsEl.textContent=targets.length;
     };
 
-    // スリング＆弾
+    // スリング＆弾（半径39＝1.5倍）
     const anchor={x:Math.max(160,W*0.24),y:Math.min(H-140,H-160)};
     let projectile=null, elastic=null;
     const GRAB_RANGE=200;
     let grabProxy=null, grabLink=null;
 
+    // 後方ストローク最大長
     let maxPull=anchor.x;
     function recalcMaxPull(){
       const innerFaceX=leftW.position.x+T/2;
@@ -252,6 +232,7 @@
         render:{fillStyle:"#e8eaed",strokeStyle:"#000",lineWidth:1.4, opacity:textures.ball?0:1}
       });
       elastic=Constraint.create({pointA:anchor,bodyB:projectile,stiffness:.035,damping:.04,render:{visible:false}});
+
       grabProxy=Bodies.circle(anchor.x,anchor.y,GRAB_RANGE,{isSensor:true,collisionFilter:{category:CF.PROJECTILE,mask:CF.PROJECTILE},render:{visible:false}});
       grabLink=Constraint.create({bodyA:grabProxy,bodyB:projectile,length:0,stiffness:1,render:{visible:false}});
       World.add(world,[projectile,elastic,grabProxy,grabLink]);
@@ -260,41 +241,48 @@
     }
     createProjectile();
 
-    // 入力
+    // マウス/タッチ
     const mouse=Mouse.create(render.canvas);
     const mctl=MouseConstraint.create(engine,{mouse,constraint:{stiffness:.12,render:{visible:false}},collisionFilter:{mask:CF.PROJECTILE}});
     World.add(world,mctl); render.mouse=mouse;
-    function syncMouseScale(){ const kx=sx(), ky=sy(); mouse.scale.x=kx; mouse.scale.y=ky; mouse.pixelRatio=render.options.pixelRatio; }
+    function syncMouseScale(){
+      const kx=sx(), ky=sy(); mouse.scale.x=kx; mouse.scale.y=ky; mouse.pixelRatio=render.options.pixelRatio;
+    }
 
-    // ゴム描画
+    // ゴム（壁より奥に描画）
     Events.on(render,'beforeRender',()=>{
       if(!projectile) return;
       const ctx=render.context, a=toScreen(anchor.x,anchor.y), b=toScreen(projectile.position.x,projectile.position.y);
-      ctx.save(); ctx.strokeStyle='#5f9cf4'; ctx.lineWidth=3; ctx.globalAlpha=.9; ctx.beginPath(); ctx.moveTo(a.x,a.y); ctx.lineTo(b.x,b.y); ctx.stroke(); ctx.restore();
+      ctx.save(); ctx.strokeStyle='#5f9cf4'; ctx.lineWidth=3; ctx.globalAlpha=.9;
+      ctx.beginPath(); ctx.moveTo(a.x,a.y); ctx.lineTo(b.x,b.y); ctx.stroke(); ctx.restore();
     });
 
-    // 画像の自前描画
+    // ★画像の自前描画：弾（円）＆ターゲット（回転矩形に貼る）
     Events.on(render,'afterRender',()=>{
       const ctx=render.context;
+      // 弾
       if(textures.ball && projectile){
         const pos=toScreen(projectile.position.x,projectile.position.y);
         const d=projectile.circleRadius*2 * sx();
         ctx.save(); ctx.beginPath(); ctx.arc(pos.x,pos.y,d/2,0,Math.PI*2); ctx.clip();
         ctx.drawImage(textures.ball,pos.x-d/2,pos.y-d/2,d,d); ctx.restore();
       }
+      // ターゲット（ここだけ差し替え：drawImageCover を使用）
       if(textures.target && targets.length){
         for(const t of targets){
           const pos=toScreen(t.position.x,t.position.y);
           const w=(t.bounds.max.x - t.bounds.min.x)*sx();
           const h=(t.bounds.max.y - t.bounds.min.y)*sy();
-          ctx.save(); ctx.translate(pos.x,pos.y); ctx.rotate(t.angle);
-          ctx.drawImage(textures.target,-w/2,-h/2,w,h);
+          ctx.save();
+          ctx.translate(pos.x,pos.y);
+          ctx.rotate(t.angle);
+          drawImageCover(ctx, textures.target, w, h);
           ctx.restore();
         }
       }
     });
 
-    // 爆発
+    // 爆発（炎色 + SFX）
     function explodeAt(pos,radius=170,power=0.038){
       const all=blocks.concat(targets);
       for(const body of all){
@@ -317,10 +305,11 @@
       noiseBurst({dur:0.35,vol:0.45,hp:500,lp:6000}); thunk({base:140,dur:0.22,vol:0.35});
     }
 
-    // 発射・判定
+    // 発射/判定（こすれ音対策：1回のみ）
     let dragging=false, launched=false, impacted=false;
     let reloadTimer=null, restFrames=0;
     let hitOnce=new Set(), worldHitPlayed=false;
+
     function scheduleReload(ms=3000){ if(!reloadTimer) reloadTimer=setTimeout(()=>reload(),ms); }
 
     Events.on(mctl,'startdrag',e=>{
@@ -330,13 +319,17 @@
     });
     Events.on(mctl,'enddrag',e=>{
       if(dragging && (e.body===projectile || e.body===grabProxy)){
-        setTimeout(()=>{ elastic.bodyB=null; dragging=false; launched=true; impacted=false; restFrames=0;
+        setTimeout(()=>{
+          elastic.bodyB=null; dragging=false; launched=true; impacted=false; restFrames=0;
           shots++; shotsEl.textContent=shots; mctl.collisionFilter.mask=0;
           projectile.isSensor=false; projectile.collisionFilter.mask=CF.WORLD|CF.BLOCK|CF.TARGET|CF.PROJECTILE;
-          hitOnce.clear(); worldHitPlayed=false; twang(Math.min(1,(maxPull||200)/200)); },0);
+          hitOnce.clear(); worldHitPlayed=false;
+          twang(Math.min(1,(maxPull||200)/200));
+        },0);
       }
     });
 
+    // ドラッグ中クランプ（後方のみ）
     Events.on(engine,'beforeUpdate',()=>{
       if(!dragging) return;
       const r=projectile.circleRadius, minX=(leftW.position.x+T/2)+r+0.001;
@@ -348,6 +341,7 @@
       if(grabProxy) Body.setPosition(grabProxy,pos);
     });
 
+    // 範囲外/停止監視
     Events.on(engine,'afterUpdate',()=>{
       if(launched && !impacted){
         const v2=projectile.velocity.x**2+projectile.velocity.y**2;
@@ -361,6 +355,7 @@
       }
     });
 
+    // 衝突（各ブロック1回・壁1回だけ音）
     Events.on(engine,'collisionStart',ev=>{
       if(!launched) return;
       for(const p of ev.pairs){
@@ -378,7 +373,7 @@
       }
     });
 
-    // 落下→スコア/クリア
+    // スコア/クリア（落下）
     const gone=new Set();
     function onFallen(body){
       if(gone.has(body.id)) return; gone.add(body.id);
@@ -416,7 +411,8 @@
       World.add(world,[projectile,grabProxy,grabLink]);
 
       launched=false; impacted=false; restFrames=0; mctl.collisionFilter.mask=CF.PROJECTILE;
-      hitOnce.clear(); worldHitPlayed=false; recalcMaxPull();
+      hitOnce.clear(); worldHitPlayed=false;
+      recalcMaxPull();
       oscBeep({freq:520,dur:0.08,type:'triangle',vol:0.22});
     };
 
@@ -455,11 +451,6 @@
 
     // 起動
     buildTower(level); applyZoomOut(); recalcMaxPull();
-
-    // 追加：実行中エラーハンドラ（画面に出す）
-    window.addEventListener('error', (e)=>{
-      document.body.insertAdjacentHTML('beforeend', '<div id="err">エラー: '+ e.message +'</div>');
-    });
   })();
   </script>
 </body>
